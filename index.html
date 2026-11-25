@@ -413,6 +413,7 @@
               </div>
             </div>
 
+            <div class="space-y-2"><label class="text-xs text-slate-300" for="transcription-engine">Transcription engine</label><select id="transcription-engine" class="w-full min-h-[44px] rounded-lg bg-studio-950 border border-studio-700 text-sm"><option value="fast">Fast (YIN)</option><option value="enhanced">Enhanced (Basic Pitch, experimental)</option></select><label class="text-xs text-slate-300">Manual BPM <input id="manual-bpm" type="number" min="40" max="240" placeholder="Auto" class="w-20 bg-studio-950 rounded p-2"></label><p class="text-[11px] text-slate-400">Enhanced downloads a model and runs locally. It is not true instrument separation. Re-transcribe to apply settings.</p></div>
             <!-- Re-Analyze Action Button -->
             <button id="btn-reanalyze" type="button" class="w-full min-h-[46px] rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-studio-950 font-bold text-xs sm:text-sm shadow-lg shadow-amber-500/15 transition-all flex items-center justify-center gap-2">
               <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.2">
@@ -981,6 +982,8 @@
         loopA: null,
         loopB: null,
         analysisBusy: false,
+        engine: 'fast',
+        detectedEvents: [],
         analysisRun: 0,
         transportGain: null,
         metronomeEnabled: false,
@@ -1930,6 +1933,33 @@
       /**
        * Full Transcription Pipeline over the active [trimStart, trimEnd] region.
        */
+      let basicPitchModule, basicPitchModel;
+      async function enhancedNotes(buffer, start, end, current) {
+        const bp = basicPitchModule ||= await import('https://esm.sh/@spotify/basic-pitch@1.0.1?bundle');
+        basicPitchModel ||= new bp.BasicPitch('https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json');
+        const notes = [];
+        for (let core = start; core < end; core += 30) {
+          if (!current()) return [];
+          const left = Math.max(start, core - 2), right = Math.min(end, core + 32);
+          const offline = createOfflineContext(1, Math.ceil((right-left)*22050), 22050);
+          const src = offline.createBufferSource(); src.buffer = buffer;
+          src.connect(offline.destination); src.start(0,left,right-left);
+          const mono = await offline.startRendering();
+          const frames=[], onsets=[];
+          await basicPitchModel.evaluateModel(mono,(f,o) => {frames.push(...f);onsets.push(...o);}, fraction => {
+            if(current()) setStatus('Enhanced • '+Math.round(100*(core-start+Math.min(1,Math.max(0,fraction))*Math.min(30,end-core))/(end-start))+'%', 'amber');
+          });
+          if (!current()) return [];
+          const events = bp.noteFramesToTime(bp.outputToNotesPoly(frames,onsets,0.30,0.25,5));
+          for(const n of events) {
+            const onsetSec = left+n.startTimeSeconds;
+            if(onsetSec < core || onsetSec >= Math.min(core+30,end) || n.pitchMidi < 23 || n.pitchMidi > 64 || n.durationSeconds < state.minNoteMs/1000) continue;
+            notes.push({midi:n.pitchMidi,onsetSec,durSec:Math.min(n.durationSeconds,end-onsetSec),amplitude:n.amplitude});
+          }
+          await new Promise(resolve=>setTimeout(resolve,0));
+        }
+        return notes.sort((a,b)=>a.onsetSec-b.onsetSec);
+      }
       async function runBassTranscriptionPipeline(options = {}) {
         if (!state.audioBuffer) return;
 
@@ -1998,7 +2028,7 @@
 
           // Segment frames into discrete bass notes (onset + pitch change + RMS re-pluck detection)
           const minFrames = Math.max(2, Math.round((state.minNoteMs / 1000) / frameDurSec));
-          const segmentedNotes = [];
+          let segmentedNotes = [];
           let cur = null;
 
           for (let i = 0; i < smoothed.length; i++) {
@@ -2047,11 +2077,28 @@
             });
           }
 
+          let engineUsed = 'Fast';
+          if (state.engine === 'enhanced') {
+            try {
+              const enhanced = await enhancedNotes(isolatedBuffer,startSec,endSec,current);
+              if (!current()) return;
+              if (!enhanced.length) throw new Error('No enhanced notes detected');
+              segmentedNotes = enhanced; engineUsed = 'Enhanced';
+            } catch (err) {
+              if (!current()) return;
+              basicPitchModel = null;
+              console.warn('Enhanced model unavailable',err);
+              showToast('Enhanced unavailable; using Fast results instead.', 'info');
+            }
+          }
+          state.detectedEvents = segmentedNotes;
           // Auto-estimate BPM unless locked by Demo or manual override option
           if (!options.keepBpm && segmentedNotes.length >= 4) {
             state.bpm = estimateBpmFromOnsets(segmentedNotes);
           }
 
+          const manual = Number(document.getElementById('manual-bpm').value);
+          if (manual >= 40 && manual <= 240) state.bpm = manual;
           // Automatic Key Detection
           const detectedKey = detectMusicalKey(segmentedNotes);
           state.detectedRootPc = detectedKey.rootPc;
@@ -2070,7 +2117,7 @@
           updateDspControlsUI();
 
           const activeNotesCount = countActiveNotes();
-          setStatus(`Ready • ${activeNotesCount} notes in ${NOTE_NAMES_FLAT[state.detectedRootPc]} ${state.detectedMode}`, 'emerald');
+          setStatus(`${engineUsed} ready • ${activeNotesCount} notes in ${NOTE_NAMES_FLAT[state.detectedRootPc]} ${state.detectedMode}`, 'emerald');
         } catch (err) {
           if (!current()) return;
           console.error('Transcription pipeline error:', err);
@@ -2111,7 +2158,8 @@
                 fret: 0,
                 wrapped: false,
                 preferredStringIdx: null,
-                onsetSec: regionStartSec + stepIdx * stepDurSec,
+                onsetSec: n.onsetSec,
+                actualDuration: n.durSec,
                 durSteps
               };
             }
@@ -2433,6 +2481,10 @@
             col.appendChild(row);
           }
 
+          if (!cell) {
+            // Show continuation of the nearest preceding detected note, not a new attack.
+            for(let j=stepIdx-1;j>=0;j--) { const prior=state.gridSteps[j]; if(!prior) continue; if(j+(prior.durSteps||1)>stepIdx) { const hint=document.createElement('span'); hint.className='absolute bottom-1 text-[9px] text-cyan-400'; hint.textContent='hold'; col.appendChild(hint); } break; }
+          }
           // Bottom Note Name Hint
           if (cell) {
             const noteLbl = document.createElement('span');
@@ -3672,6 +3724,7 @@
           }
         });
 
+        document.getElementById('transcription-engine').addEventListener('change', e => { state.engine = e.target.value; });
         dom.btnReanalyze.addEventListener('click', () => runBassTranscriptionPipeline({ keepBpm: true }));
         dom.btnTranscribeTrim.addEventListener('click', () => runBassTranscriptionPipeline({ keepBpm: false }));
 
