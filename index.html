@@ -120,7 +120,7 @@
     }
 
     .main-bottom-pad {
-      padding-bottom: calc(7.5rem + env(safe-area-inset-bottom, 0px));
+      padding-bottom: calc(14rem + env(safe-area-inset-bottom, 0px));
     }
 
     /* Fretboard realistic string thicknesses */
@@ -605,7 +605,7 @@
 
           <!-- Helper Legend -->
           <div class="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
-            <span>Tap any fret number (or empty beat slot) to edit string position, fret, or octave.</span>
+            <span>Tap any tab position to seek playback and open note editing. Use Audition to preview a note.</span>
             <span id="wrapped-legend" class="hidden items-center gap-1.5 font-mono text-cyan-300">
               <span class="w-2 h-2 rounded-full bg-cyan-400"></span> Cyan ring = Octave-wrapped to stay on neck
             </span>
@@ -713,6 +713,8 @@
   <!-- ===================================================================== -->
   <footer class="fixed bottom-0 inset-x-0 z-40 bg-studio-950/95 backdrop-blur-xl border-t border-studio-750 safe-bottom-bar pt-2.5 px-3 sm:px-5 lg:px-8 shadow-2xl">
     <div class="max-w-[1440px] mx-auto space-y-1.5">
+      <div class="flex items-center gap-2"><input id="practice-seek" type="range" min="0" max="0" step="0.1" value="0" class="flex-1 min-w-0" aria-label="Playback position"><span id="practice-time" class="text-[11px] font-mono text-slate-300 shrink-0">0:00 / 0:00</span></div>
+      <div class="flex flex-wrap items-center gap-1 text-xs"><button id="practice-back" type="button" class="px-3 min-h-[40px] rounded-lg bg-studio-800">−10s</button><button id="practice-forward" type="button" class="px-3 min-h-[40px] rounded-lg bg-studio-800">+10s</button><button id="practice-a" type="button" class="px-3 min-h-[40px] rounded-lg bg-studio-800">Set A</button><button id="practice-b" type="button" class="px-3 min-h-[40px] rounded-lg bg-studio-800">Set B</button><button id="practice-clear" type="button" class="px-3 min-h-[40px] rounded-lg bg-studio-800">Clear</button><span id="practice-loop-label" class="text-[11px] font-mono text-cyan-300">A: unset • B: unset</span></div>
       <!-- Transposition Audio Mode Notice Banner (Shown when transposed != 0) -->
       <div id="transport-key-notice" class="hidden px-3 py-1 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] font-mono flex items-center justify-between gap-2">
         <span id="transport-key-notice-text" class="text-amber-300 truncate">Tab Synth playing transposed key</span>
@@ -733,7 +735,7 @@
 
           <button id="btn-loop-toggle" type="button" class="min-h-[46px] px-3 rounded-xl bg-studio-850 hover:bg-studio-750 border border-studio-700 text-slate-300 font-mono font-semibold text-xs flex items-center gap-1.5 transition-all" title="Loop Trimmed Region (Shortcut: L)">
             <span>🔁</span>
-            <span class="hidden sm:inline">A–B Loop</span>
+            <span>A–B Loop</span>
           </button>
 
           <button id="btn-metro-toggle" type="button" class="min-h-[46px] px-3 rounded-xl bg-studio-850 hover:bg-studio-750 border border-studio-700 text-slate-300 font-mono font-semibold text-xs flex items-center gap-1.5 transition-all" title="Toggle 4/4 Metronome Click">
@@ -976,6 +978,11 @@
         audioOutputMode: 'synth',   // 'synth' | 'original' | 'isolated'
         playbackSpeed: 1.0,         // 0.5 | 0.75 | 1.0
         loopEnabled: false,
+        loopA: null,
+        loopB: null,
+        analysisBusy: false,
+        analysisRun: 0,
+        transportGain: null,
         metronomeEnabled: false,
         playheadSec: 0,
         playStartCtxTime: 0,
@@ -1657,6 +1664,7 @@
         state.audioBuffer = rendered;
         state.trimStart = 0;
         state.trimEnd = rendered.duration;
+        clearPracticeLoop();
         state.playheadSec = 0;
         state.trimDirty = false;
         dom.btnTranscribeTrim.classList.add('hidden');
@@ -1925,10 +1933,16 @@
       async function runBassTranscriptionPipeline(options = {}) {
         if (!state.audioBuffer) return;
 
+        const run = ++state.analysisRun;
+        const source = state.audioBuffer;
+        stopTransport();
+        state.analysisBusy = true;
+        const current = () => run === state.analysisRun && source === state.audioBuffer;
         setStatus('Isolating bass & tracking pitch...', 'amber');
 
         try {
           const { isolatedBuffer, yinBuffer } = await buildFilteredBuffers(state.audioBuffer);
+          if (!current()) return;
           state.isolatedBuffer = isolatedBuffer;
 
           const sr = yinBuffer.sampleRate; // 16000 Hz
@@ -1944,10 +1958,16 @@
           const frameDurSec = hop / sr;
           const rawFrames = [];
 
+          const gateDb = state.gateDb;
           for (let pos = startSample; pos <= endSample; pos += hop) {
+            if ((pos - startSample) % (hop * 64) === 0) {
+              setStatus(`Transcribing ${Math.min(100, Math.round(100 * (pos - startSample) / Math.max(1, endSample - startSample)))}%`, 'amber');
+              await new Promise(resolve => setTimeout(resolve, 0));
+              if (!current()) return;
+            }
             const db = computeRmsDb(samples, pos, 768);
             const timeSec = pos / sr;
-            if (db < state.gateDb) {
+            if (db < gateDb) {
               rawFrames.push({ timeSec, midi: null, db });
               continue;
             }
@@ -2052,9 +2072,12 @@
           const activeNotesCount = countActiveNotes();
           setStatus(`Ready • ${activeNotesCount} notes in ${NOTE_NAMES_FLAT[state.detectedRootPc]} ${state.detectedMode}`, 'emerald');
         } catch (err) {
+          if (!current()) return;
           console.error('Transcription pipeline error:', err);
           setStatus('Analysis error', 'rose');
           showToast('Could not analyze audio buffer. Try adjusting trim or uploading another clip.', 'error');
+        } finally {
+          if (run === state.analysisRun) state.analysisBusy = false;
         }
       }
 
@@ -2070,7 +2093,7 @@
         // Pad up to complete 4/4 bars (minimum 2 bars = 16 or 32 steps)
         const minBars = 2;
         const totalBars = Math.max(minBars, Math.ceil(rawSteps / state.stepsPerBar));
-        const totalSteps = Math.min(256, totalBars * state.stepsPerBar);
+        const totalSteps = totalBars * state.stepsPerBar;
 
         const grid = new Array(totalSteps).fill(null);
 
@@ -2321,6 +2344,7 @@
 
         dom.lblNoteCount.textContent = `${countActiveNotes()} notes`;
         dom.interactiveTabGrid.innerHTML = '';
+        state.activeHighlightedStep = -1;
 
         if (totalSteps === 0) {
           const emptyMsg = document.createElement('div');
@@ -2419,9 +2443,7 @@
 
           col.addEventListener('click', () => {
             state.selectedStepIdx = stepIdx;
-            if (cell) {
-              auditionSingleMidi(cell.effectiveMidi);
-            }
+            seekPlayhead(state.trimStart + stepIdx * getStepDurationSec());
             renderInteractiveTab();
             renderFretboard();
             updateNoteInspectorUI();
@@ -2713,6 +2735,7 @@
         dom.lblTrimEnd.textContent = formatTime(te);
         dom.lblTrimLen.textContent = `${(te - ts).toFixed(1)}s`;
         dom.lblPlayhead.textContent = formatTime(state.playheadSec);
+        updatePracticeUI();
       }
 
       function drawVisualizerCanvas() {
@@ -2908,6 +2931,7 @@
           const t = xToTime(e.clientX);
           const minClipLen = Math.min(0.8, dur * 0.25);
 
+          if (state.draggingHandle === 'start' || state.draggingHandle === 'end') { if (state.isPlaying) pauseTransport(); clearPracticeLoop(); }
           if (state.draggingHandle === 'start') {
             state.trimStart = Math.max(0, Math.min(t, state.trimEnd - minClipLen));
             if (state.playheadSec < state.trimStart) state.playheadSec = state.trimStart;
@@ -2941,6 +2965,16 @@
         return (60 / state.bpm) * beatsPerStep;
       }
 
+      function loopStart() { return state.loopEnabled && state.loopA !== null ? Math.max(state.trimStart, state.loopA) : state.trimStart; }
+      function loopEnd() { return state.loopEnabled && state.loopB !== null ? Math.min(state.trimEnd, state.loopB) : state.trimEnd; }
+      function clearPracticeLoop() { state.loopA = null; state.loopB = null; if (state.loopEnabled) dom.btnLoopToggle.click(); updatePracticeUI(); }
+      function updatePracticeUI() {
+        const slider = document.getElementById('practice-seek');
+        if (!slider) return;
+        slider.min = String(state.trimStart); slider.max = String(state.trimEnd); slider.value = String(state.playheadSec);
+        document.getElementById('practice-time').textContent = `${formatTime(state.playheadSec)} / ${formatTime(state.trimEnd)}`;
+        document.getElementById('practice-loop-label').textContent = `A: ${state.loopA === null ? 'unset' : formatTime(state.loopA)} • B: ${state.loopB === null ? 'unset' : formatTime(state.loopB)}${state.loopEnabled ? ' • LOOP ON' : ''}`;
+      }
       function stopActiveBufferNode() {
         if (state.activeBufferSource) {
           try { state.activeBufferSource.onended = null; state.activeBufferSource.stop(); } catch (_) {}
@@ -2963,7 +2997,7 @@
         src.connect(state.playbackAnalyser || ctx.destination);
 
         const safeOffset = Math.max(0, Math.min(offsetSec, buf.duration - 0.01));
-        src.start(0, safeOffset);
+        src.start(0, safeOffset, Math.max(0.001, Math.min(buf.duration, loopEnd()) - safeOffset));
         state.activeBufferSource = src;
       }
 
@@ -2980,7 +3014,7 @@
         const stepDurTrack = getStepDurationSec();
         const beatDurTrack = 60 / state.bpm;
         const currentTrackSec = state.playStartTrackSec + (now - state.playStartCtxTime) * state.playbackSpeed;
-        const horizonTrackSec = Math.min(state.trimEnd, currentTrackSec + lookaheadSec * state.playbackSpeed);
+        const horizonTrackSec = Math.min(loopEnd(), currentTrackSec + lookaheadSec * state.playbackSpeed);
 
         // 1. Schedule Tab Synth Notes if in 'synth' mode
         if (state.audioOutputMode === 'synth' && state.gridSteps.length > 0) {
@@ -2988,14 +3022,14 @@
             const stepTrackTime = state.trimStart + state.nextScheduleStep * stepDurTrack;
             if (stepTrackTime > horizonTrackSec) break;
 
-            if (stepTrackTime >= currentTrackSec - 0.03 && stepTrackTime < state.trimEnd) {
+            if (stepTrackTime >= currentTrackSec - 0.03 && stepTrackTime < loopEnd()) {
               const cell = state.gridSteps[state.nextScheduleStep];
               if (cell) {
                 const whenCtx = now + Math.max(0, (stepTrackTime - currentTrackSec) / state.playbackSpeed);
-                const realNoteDur = ((cell.durSteps || 1) * stepDurTrack * 0.88) / state.playbackSpeed;
+                const realNoteDur = Math.min((cell.durSteps || 1) * stepDurTrack * 0.88, loopEnd() - stepTrackTime) / state.playbackSpeed;
                 scheduleBassNoteVoice(
                   ctx,
-                  state.playbackAnalyser || ctx.destination,
+                  state.transportGain || state.playbackAnalyser || ctx.destination,
                   cell.effectiveMidi,
                   whenCtx,
                   realNoteDur,
@@ -3011,11 +3045,11 @@
         if (state.metronomeEnabled) {
           while (true) {
             const beatTrackTime = state.trimStart + state.nextMetroBeat * beatDurTrack;
-            if (beatTrackTime > horizonTrackSec || beatTrackTime >= state.trimEnd) break;
+            if (beatTrackTime > horizonTrackSec || beatTrackTime >= loopEnd()) break;
             if (beatTrackTime >= currentTrackSec - 0.03) {
               const whenCtx = now + Math.max(0, (beatTrackTime - currentTrackSec) / state.playbackSpeed);
               const isDownbeat = (state.nextMetroBeat % 4) === 0;
-              scheduleMetronomeClick(ctx, state.playbackAnalyser || ctx.destination, whenCtx, isDownbeat);
+              scheduleMetronomeClick(ctx, state.transportGain || state.playbackAnalyser || ctx.destination, whenCtx, isDownbeat);
             }
             state.nextMetroBeat++;
           }
@@ -3058,10 +3092,10 @@
         const now = state.audioCtx.currentTime;
         let curSec = state.playStartTrackSec + (now - state.playStartCtxTime) * state.playbackSpeed;
 
-        if (curSec >= state.trimEnd) {
+        if (curSec >= loopEnd()) {
           if (state.loopEnabled) {
             // Seamless A-B Loop Restart
-            beginPlaybackFrom(state.trimStart);
+            beginPlaybackFrom(loopStart());
             return;
           } else {
             stopTransport();
@@ -3071,6 +3105,7 @@
 
         state.playheadSec = curSec;
         dom.lblPlayhead.textContent = formatTime(curSec);
+        updatePracticeUI();
 
         // Compute active grid step for visual tab & fretboard sync
         const stepDur = getStepDurationSec();
@@ -3087,8 +3122,12 @@
         configureAudioSession('playback');
 
         const ctx = getAudioContext();
-        const clampedStart = (startTrackSec >= state.trimEnd - 0.05 || startTrackSec < state.trimStart)
-          ? state.trimStart
+        if (state.analysisBusy) return;
+        if (state.transportGain) { try { state.transportGain.disconnect(); } catch (_) {} }
+        state.transportGain = ctx.createGain();
+        state.transportGain.connect(state.playbackAnalyser || ctx.destination);
+        const clampedStart = (startTrackSec >= loopEnd() - 0.05 || startTrackSec < loopStart())
+          ? loopStart()
           : startTrackSec;
 
         state.isPlaying = true;
@@ -3117,8 +3156,11 @@
 
       function pauseTransport() {
         if (!state.isPlaying) return;
+        state.playheadSec = Math.min(loopEnd(), state.playStartTrackSec + (state.audioCtx.currentTime - state.playStartCtxTime) * state.playbackSpeed);
         state.isPlaying = false;
+        if (state.transportGain) { try { state.transportGain.disconnect(); } catch (_) {} state.transportGain = null; }
         stopActiveBufferNode();
+        updateTrimReadoutUI();
         if (state.schedulerTimerId) {
           clearInterval(state.schedulerTimerId);
           state.schedulerTimerId = null;
@@ -3134,7 +3176,7 @@
 
       function stopTransport() {
         pauseTransport();
-        state.playheadSec = state.trimStart;
+        state.playheadSec = loopStart();
         highlightPlaybackStep(-1);
         renderFretboard();
         updateTrimReadoutUI();
@@ -3142,6 +3184,8 @@
       }
 
       function seekPlayhead(targetSec) {
+        targetSec = Math.max(state.trimStart, Math.min(state.trimEnd, targetSec));
+        if (state.loopEnabled && (targetSec < loopStart() || targetSec >= loopEnd())) { dom.btnLoopToggle.click(); }
         state.playheadSec = targetSec;
         updateTrimReadoutUI();
         drawVisualizerCanvas();
@@ -3208,8 +3252,8 @@
           state.sourceName = file.name;
           state.transposeSemitones = 0;
           state.trimStart = 0;
-          // For long recordings (> 45s), pre-position end trim handle to first 30s so mobile transcription is fast & snappy, while full clip remains available!
-          state.trimEnd = decoded.duration > 45 ? 30 : decoded.duration;
+          state.trimEnd = decoded.duration;
+          clearPracticeLoop();
           state.playheadSec = 0;
 
           dom.sourceNamePill.textContent = file.name;
@@ -3232,11 +3276,7 @@
           computeWaveformPeaks(decoded);
           await runBassTranscriptionPipeline({ keepBpm: false });
 
-          if (decoded.duration > 45) {
-            showToast('Transcribed first 30s — drag the waveform trim handles to isolate any section of your clip!', 'info');
-          } else {
-            showToast(`Loaded "${file.name}" and generated bass tab.`, 'success');
-          }
+          if (state.audioBuffer === decoded && state.gridSteps.length) showToast('Full song loaded. Tap tab notes to seek or set a practice loop.', 'info');
         } catch (err) {
           console.error('Media decode failed:', err);
           dom.videoExtractStatus.classList.add('hidden');
@@ -3412,6 +3452,7 @@
           state.transposeSemitones = 0;
           state.trimStart = 0;
           state.trimEnd = recordedBuf.duration;
+          clearPracticeLoop();
           state.playheadSec = 0;
 
           dom.sourceNamePill.textContent = state.sourceName;
@@ -3651,6 +3692,7 @@
           if (!state.audioBuffer) return;
           state.trimStart = 0;
           state.trimEnd = state.audioBuffer.duration;
+          clearPracticeLoop();
           state.playheadSec = 0;
           updateTrimReadoutUI();
           drawVisualizerCanvas();
@@ -3790,12 +3832,22 @@
         dom.btnStop.addEventListener('click', stopTransport);
 
         dom.btnLoopToggle.addEventListener('click', () => {
+          if (state.loopA !== null && state.loopB !== null && state.loopB - state.loopA < 0.25) { showToast('Set B after A.', 'info'); return; }
           state.loopEnabled = !state.loopEnabled;
+          updatePracticeUI();
+          if (state.isPlaying) beginPlaybackFrom(state.playheadSec);
           dom.btnLoopToggle.className = state.loopEnabled
             ? 'min-h-[46px] px-3 rounded-xl bg-cyan-500/20 border border-cyan-400 text-cyan-300 font-mono font-semibold text-xs flex items-center gap-1.5 transition-all'
             : 'min-h-[46px] px-3 rounded-xl bg-studio-850 hover:bg-studio-750 border border-studio-700 text-slate-300 font-mono font-semibold text-xs flex items-center gap-1.5 transition-all';
         });
 
+        const practice = id => document.getElementById(id);
+        practice('practice-seek').addEventListener('input', e => seekPlayhead(Number(e.target.value)));
+        practice('practice-back').addEventListener('click', () => seekPlayhead(state.playheadSec - 10));
+        practice('practice-forward').addEventListener('click', () => seekPlayhead(state.playheadSec + 10));
+        practice('practice-a').addEventListener('click', () => { if (!state.audioBuffer) return; if (state.loopEnabled) dom.btnLoopToggle.click(); state.loopA = state.playheadSec; if (state.loopB !== null && state.loopB <= state.loopA + 0.25) state.loopB = null; updatePracticeUI(); });
+        practice('practice-b').addEventListener('click', () => { if (!state.audioBuffer) return; const a = state.loopA ?? state.trimStart; if (state.playheadSec - a < 0.25) { showToast('Move playback after A before setting B.', 'info'); return; } if (state.loopEnabled) dom.btnLoopToggle.click(); state.loopA = a; state.loopB = state.playheadSec; updatePracticeUI(); dom.btnLoopToggle.click(); seekPlayhead(a); });
+        practice('practice-clear').addEventListener('click', clearPracticeLoop);
         dom.btnMetroToggle.addEventListener('click', () => {
           state.metronomeEnabled = !state.metronomeEnabled;
           dom.btnMetroToggle.className = state.metronomeEnabled
